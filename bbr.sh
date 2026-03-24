@@ -83,7 +83,7 @@ else
 fi
 
 echo "-----------------------------------------------"
-echo "1) 升级内核 (解决 No such file 报错 / 开启 CAKE)"
+echo "1) 升级内核"
 echo "2) 应用/更新 TCP 加速配置 (BBR + BDP)"
 echo "3) 卸载加速配置"
 read -p "请选择 [1-3, 默认2]: " MAIN_CHOICE
