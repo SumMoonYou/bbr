@@ -1,162 +1,141 @@
 #!/bin/bash
-# =================================================
-# 代理服务器性能优化脚本（BBR + fq-pie）
-# 专注多线程性能优化
-# 兼容：Debian / Ubuntu / CentOS / RHEL / Rocky / AlmaLinux
-# =================================================
 
-set -e
+# =============================================================
+# 脚本名称: BBR + BDP + QDisc 综合加速工具 (专业注释版)
+# 默认参数: 带宽 1000 Mbps / 延迟 160 ms
+# 适用环境: 跨境长距离传输、高带宽服务器、游戏/视频加速
+# =============================================================
 
-SYSCTL_CONF="/etc/sysctl.d/99-bbr-fqpie.conf"
-LIMITS_CONF="/etc/security/limits.d/99-nofile-nproc.conf"
-SYSTEMD_CONF="/etc/systemd/system.conf.d/99-limits.conf"
-
-# 必须 root
-if [ "$(id -u)" -ne 0 ]; then
-    clear
-    echo "Error: This script must be run as root!"
-    exit 1
+# 检查是否以 root 权限运行，修改内核参数必须需要 root
+if [[ $EUID -ne 0 ]]; then
+   echo "错误: 请使用 root 权限运行此脚本。"
+   exit 1
 fi
 
-# 获取当前加速方式
-function get_bbr_status() {
-    TCP_CC=$(sysctl -n net.ipv4.tcp_congestion_control)
-    QDISC=$(sysctl -n net.core.default_qdisc)
-    if [ "$TCP_CC" == "bbr" ] && [ "$QDISC" == "fq_pie" ]; then
-        echo "BBR + fq-pie (TCP 加速)"
-    elif [ "$TCP_CC" == "bbr" ]; then
-        echo "BBR + $QDISC (TCP 加速，但队列非 fq-pie)"
-    else
-        echo "$TCP_CC + $QDISC (未启用 BBR)"
-    fi
+# 自动安装 bc 计算器（Bash 原生不支持浮点运算，计算 BDP 必须用到它）
+if command -v apt-get >/dev/null; then
+    apt-get update -y >/dev/null 2>&1 && apt-get install -y bc >/dev/null 2>&1
+elif command -v yum >/dev/null; then
+    yum install -y bc >/dev/null 2>&1
+fi
+
+# --- 函数：实时检测并显示当前内核网络参数 ---
+check_status() {
+    # 获取当前系统默认的队列调度算法
+    local cur_qdisc=$(sysctl net.core.default_qdisc | awk '{print $3}')
+    # 获取当前生效的 TCP 拥塞控制算法
+    local cur_bbr=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+    # 获取当前最大接收缓冲区大小 (Bytes)
+    local cur_rmem=$(sysctl net.core.rmem_max | awk '{print $3}')
+    # 将字节转换为 MB 方便阅读
+    local cur_rmem_mb=$(echo "$cur_rmem / 1024 / 1024" | bc)
+
+    echo "-----------------------------------------------"
+    echo "📊 当前系统网络加速状态:"
+    echo "   >> 队列算法 (QDisc):  $cur_qdisc"
+    echo "   >> 拥塞控制 (TCP):    $cur_bbr"
+    echo "   >> 最大缓存 (Buffer): ${cur_rmem_mb} MB"
+    echo "-----------------------------------------------"
 }
 
-# 安装 / 开启 BBR + fq-pie
-function install_bbr() {
-    echo "正在配置 BBR + fq-pie..."
+clear
+echo "==============================================="
+echo "   TCP 综合加速工具 (BBR + BDP + QDisc)"
+echo "==============================================="
+check_status # 展示当前配置
 
-    # 强制设置 BBR 和 fq-pie 队列
-    sudo sysctl -w net.ipv4.tcp_congestion_control=bbr  # 切换到 BBR 拥塞控制
-    sudo sysctl -w net.core.default_qdisc=fq_pie  # 切换到 fq-pie 队列调度器
-    sudo sysctl --system  # 重新加载配置
+echo "1) 应用/更新 加速配置"
+echo "2) 卸载加速配置 (恢复系统默认)"
+read -p "请选择 [1-2, 默认1]: " MAIN_CHOICE
+MAIN_CHOICE=${MAIN_CHOICE:-1}
 
-    # 写入 BBR + fq-pie 配置
-    cat > $SYSCTL_CONF <<EOF
-# 启用 BBR 和 fq-pie
-net.core.default_qdisc=fq_pie
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_tw_reuse=1
-net.core.netdev_max_backlog=250000
-net.core.somaxconn=4096
-net.ipv4.tcp_max_syn_backlog=4096
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 87380 16777216
-net.ipv4.tcp_fastopen=3
-fs.file-max=1000000
-EOF
+# 卸载逻辑：删除自定义配置文件并重新加载系统默认值
+if [[ "$MAIN_CHOICE" == "2" ]]; then
+    rm -f /etc/sysctl.d/99-net-speedup.conf
+    sysctl --system > /dev/null
+    echo "✅ 已卸载优化配置，系统已恢复默认。"
+    exit 0
+fi
 
-    # 优化 TCP 参数
-    cat > /etc/sysctl.d/99-tcp-tuning.conf <<EOF
-fs.file-max = 524288
+# 环境识别：BBR 需要 4.9+，CAKE 算法建议 4.19+
+kernel_ver=$(uname -r | cut -d- -f1)
+can_cake=$(echo "$kernel_ver >= 4.19" | bc)
+
+# 参数交互：获取用户带宽和延迟数据
+echo "-----------------------------------------------"
+echo "💡 提示: 直接回车将使用预设值 (1000M / 160ms)"
+read -p "请输入下行带宽 (Mbps, 默认 1000): " BANDWIDTH
+BANDWIDTH=${BANDWIDTH:-1000}
+
+read -p "请输入目标延迟 (ms, 默认 160): " LATENCY
+LATENCY=${LATENCY:-160}
+
+# --- 核心计算：BDP (带宽时延乘积) ---
+# 计算公式：(带宽 Mbps * 10^6 / 8 转换成字节) * (延迟 ms / 10^3 转换成秒)
+# 简化系数：带宽 * 延迟 * 125
+# 预留 2 倍：应对网络剧烈抖动时的突发流量缓存
+BDP=$(echo "$BANDWIDTH * $LATENCY * 125 * 2" | bc)
+
+# 边界值保护：最小不低于 16MB，最大不超过 256MB（防止小内存 VPS 爆内存）
+[ "$BDP" -lt 16777216 ] && BDP=16777216
+[ "$BDP" -gt 268435456 ] && BDP=268435456
+MAX_BUF_MB=$(echo "$BDP / 1024 / 1024" | bc)
+
+# 算法菜单选择
+echo "-----------------------------------------------"
+echo "选择调度算法 (QDisc):"
+echo "1) FQ   (BBR标配: 适合极致吞吐、看 4K 视频、拉大文件)"
+if [ "$can_cake" -eq 1 ]; then
+    echo "2) CAKE (现代算法: 智能分配带宽、显著改善游戏/语音延迟)"
+else
+    echo "x) CAKE (当前内核 $kernel_ver 过低，暂不支持)"
+fi
+read -p "请选择 [1-2, 默认1]: " QCHOICE
+QCHOICE=${QCHOICE:-1}
+
+if [[ "$QCHOICE" == "2" && "$can_cake" -eq 1 ]]; then
+    SELECTED_QDISC="cake"
+else
+    SELECTED_QDISC="fq"
+fi
+
+# --- 写入持久化内核配置 ---
+# 使用 sysctl.d 目录，不破坏主配置，优先级更高
+cat > /etc/sysctl.d/99-net-speedup.conf << EOF
+# 开启 BBR 拥塞控制算法
+net.core.default_qdisc = $SELECTED_QDISC
 net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq_pie
+
+# TCP 接收/发送缓冲区最大值限制 (由 BDP 计算得出)
+net.core.rmem_max = $BDP
+net.core.wmem_max = $BDP
+
+# TCP 缓冲区自动调整参数: [最小 初始 最大]
+net.ipv4.tcp_rmem = 4096 87380 $BDP
+net.ipv4.tcp_wmem = 4096 65536 $BDP
+
+# 启用窗口缩放因子 (必须开启，否则最大窗口受限于 64KB)
+net.ipv4.tcp_window_scaling = 1
+
+# 开启 MTU 探测（自动发现路径最优包大小，解决部分线路“大包被丢弃”导致的断连）
+net.ipv4.tcp_mtu_probing = 1
+
+# 禁用闲置后的慢启动（防止连接建立一段时间不传输后速度降到最低）
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_rmem = 8192 262144 536870912
-net.ipv4.tcp_wmem = 4096 16384 536870912
-net.ipv4.tcp_adv_win_scale = -2
-net.ipv4.tcp_notsent_lowat = 131072
+
+# 设置“未发送数据”低水位，有效缓解 BBR 的缓冲区膨胀（Bufferbloat）
+net.ipv4.tcp_notsent_lowat = 16384
+
+# 快速回收/重用 TIME_WAIT 连接，适合高并发短连接场景
+net.ipv4.tcp_fin_timeout = 20
+net.ipv4.tcp_tw_reuse = 1
 EOF
 
-    # 加载 sysctl 配置
-    sysctl --system
+# 应用配置：立即载入所有 sysctl 参数
+sysctl --system > /dev/null
 
-    # 配置系统资源限制
-    cat > $LIMITS_CONF <<EOF
-* soft     nproc    131072
-* hard     nproc    131072
-* soft     nofile   262144
-* hard     nofile   262144
-
-root soft  nproc    131072
-root hard  nproc    131072
-root soft  nofile   262144
-root hard  nofile   262144
-EOF
-
-    # 配置 systemd 默认限制
-    mkdir -p /etc/systemd/system.conf.d
-    cat > $SYSTEMD_CONF <<EOF
-[Manager]
-DefaultLimitNOFILE=262144
-DefaultLimitNPROC=131072
-EOF
-
-    # 重新加载 systemd 配置
-    systemctl daemon-reexec
-
-    echo "BBR + fq-pie 已启用 ✅ 当前加速方式: $(get_bbr_status)"
-}
-
-# 卸载 / 恢复默认
-function uninstall_bbr() {
-    if [ -f "$SYSCTL_CONF" ]; then
-        rm -f "$SYSCTL_CONF"
-        sysctl --system
-        echo "BBR 已卸载，当前加速方式: $(get_bbr_status)"
-    else
-        echo "BBR 未安装或已卸载"
-    fi
-}
-
-# 查看状态
-function status_bbr() {
-    echo "当前加速方式: $(get_bbr_status)"
-}
-
-# 连接复用与 TCP 优化
-function optimize_connections() {
-    echo "正在优化连接复用和 TCP 参数..."
-
-    # 启用 TCP Keepalive 和 Fast Open
-    sysctl -w net.ipv4.tcp_keepalive_time=120
-    sysctl -w net.ipv4.tcp_keepalive_intvl=30
-    sysctl -w net.ipv4.tcp_keepalive_probes=5
-    sysctl -w net.ipv4.tcp_fastopen=3
-
-    # 增加最大文件描述符
-    ulimit -n 1000000
-
-    echo "连接复用与 TCP 优化完成！"
-}
-
-# SSH 终端菜单
-function menu() {
-    while true; do
-        clear
-        echo "========================================"
-        echo "        SSH 网络优化管理脚本"
-        echo "========================================"
-        echo "当前加速方式: $(get_bbr_status)"
-        echo "----------------------------------------"
-        echo "1) 安装 / 开启 BBR + fq-pie"
-        echo "2) 卸载 / 恢复默认"
-        echo "3) 查看加速状态"
-        echo "4) 优化连接与 TCP 参数"
-        echo "0) 退出"
-        echo "----------------------------------------"
-        read -p "请选择操作: " choice
-        case $choice in
-            1) install_bbr; read -p "按回车继续..." ;;
-            2) uninstall_bbr; read -p "按回车继续..." ;;
-            3) status_bbr; read -p "按回车继续..." ;;
-            4) optimize_connections; read -p "按回车继续..." ;;
-            0) exit 0 ;;
-            *) echo "无效选项"; read -p "按回车继续..." ;;
-        esac
-    done
-}
-
-menu
+echo "-----------------------------------------------"
+echo "✅ 优化成功应用！"
+check_status # 再次显示，确认参数已写入内核
+echo "-----------------------------------------------"
+echo "建议：如果是为了下载速度选 FQ；如果是为了降低游戏抖动选 CAKE。"
