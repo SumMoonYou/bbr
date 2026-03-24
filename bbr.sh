@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =============================================================
-# 脚本名称: BBR + BDP + 内核自动升级工具 (终极整合版)
-# 支持系统: Debian, Ubuntu, CentOS, AlmaLinux, Rocky Linux
+# 脚本名称: BBR + BDP 综合加速 (状态感知版)
+# 功能：内核升级、参数自定义、单线程优化、实时状态查询
 # =============================================================
 
 if [[ $EUID -ne 0 ]]; then
@@ -10,133 +10,109 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 1. 基础组件安装
+# 1. 环境准备
 install_deps() {
-    echo "正在检查并安装必要组件..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y >/dev/null 2>&1 && apt-get install -y bc curl wget >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y bc curl wget >/dev/null 2>&1
+    if ! command -v bc >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null; then
+            apt-get update -y >/dev/null 2>&1 && apt-get install -y bc >/dev/null 2>&1
+        elif command -v yum >/dev/null; then
+            yum install -y bc >/dev/null 2>&1
+        fi
     fi
 }
 install_deps
 
-# --- 函数：升级内核 ---
-upgrade_kernel() {
-    echo "-----------------------------------------------"
-    echo "正在准备升级内核..."
+# --- 2. 核心显示模块：检测当前加速类型 ---
+show_status() {
+    # 获取内核参数
+    local c_bbr=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    local c_qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')
+    local c_rmem=$(sysctl net.core.rmem_max 2>/dev/null | awk '{print $3}')
     
-    if [ -f /etc/debian_version ]; then
-        # Debian/Ubuntu 升级
-        echo "检测到 Debian/Ubuntu 系统，正在安装最新内核..."
-        apt-get update -y
-        apt-get install -y linux-image-generic linux-headers-generic
-    elif [ -f /etc/redhat-release ]; then
-        # CentOS/RHEL/Alma/Rocky 升级
-        echo "检测到 RHEL 系系统，正在通过 ELRepo 安装最新内核..."
-        rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
-        local rel_ver=$(rpm -E %rhel)
-        if [ "$rel_ver" == "7" ]; then
-            yum install -y https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm
-        else
-            yum install -y "https://www.elrepo.org/elrepo-release-${rel_ver}.el${rel_ver}.elrepo.noarch.rpm"
-        fi
-        yum --enablerepo=elrepo-kernel install -y kernel-ml kernel-ml-devel
-        # 设置 grub 默认启动最新内核
-        if command -v grub2-set-default >/dev/null; then
-            grub2-set-default 0
-        fi
-    else
-        echo "错误: 未知系统，请手动升级内核。"
-        return 1
-    fi
+    # 逻辑判断显示标签
+    local bbr_label="\033[31m未开启\033[0m"
+    [[ "$c_bbr" == "bbr" ]] && bbr_label="\033[32mBBR 加速中 (已生效)\033[0m"
+    
+    local qdisc_label="\033[31m默认/未知\033[0m"
+    [[ "$c_qdisc" == "fq" ]] && qdisc_label="\033[32mFQ (单线程强力型)\033[0m"
+    [[ "$c_qdisc" == "cake" ]] && qdisc_label="\033[32mCAKE (综合平滑型)\033[0m"
+    
+    local rmem_mb=$(echo "$c_rmem / 1024 / 1024" | bc 2>/dev/null || echo "0")
 
-    echo "-----------------------------------------------"
-    echo "✅ 内核安装完成！必须重启系统后才能应用加速。"
-    read -p "是否现在重启系统？(y/n): " CONFIRM_REBOOT
-    if [[ "$CONFIRM_REBOOT" == "y" || "$CONFIRM_REBOOT" == "Y" ]]; then
-        reboot
-    else
-        echo "请稍后手动重启，重启前加速配置不会完全生效。"
-        exit 0
-    fi
+    echo -e "-----------------------------------------------"
+    echo -e "📊 \033[1m当前网络加速看板\033[0m"
+    echo -e "   >> 拥塞控制算法 : $bbr_label"
+    echo -e "   >> 队列调度算法 : $qdisc_label"
+    echo -e "   >> TCP 最大缓存 : ${rmem_mb} MB"
+    echo -e "   >> 系统内核版本 : $(uname -r)"
+    echo -e "-----------------------------------------------"
 }
 
-# --- 2. 主程序开始 ---
+# --- 3. 内核升级逻辑 ---
+upgrade_kernel() {
+    echo "正在检测系统发行版并准备升级内核..."
+    if [ -f /etc/debian_version ]; then
+        apt-get update && apt-get install -y linux-image-generic linux-headers-generic
+    elif [ -f /etc/redhat-release ]; then
+        rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
+        local rv=$(rpm -E %rhel)
+        yum install -y "https://www.elrepo.org/elrepo-release-${rv}.el${rv}.elrepo.noarch.rpm"
+        yum --enablerepo=elrepo-kernel install -y kernel-ml kernel-ml-devel
+        [[ -f /usr/sbin/grubby ]] && grubby --set-default=$(ls /boot/vmlinuz-*ml*)
+    fi
+    echo -e "\033[32m内核安装完毕，请重启系统！\033[0m"
+    read -p "是否立即重启? (y/n): " res && [[ "$res" == "y" ]] && reboot
+}
+
+# --- 4. 主菜单 ---
 clear
 echo "==============================================="
-echo "      TCP 综合调优 + 内核升级工具"
+echo "      TCP BDP 综合调优工具 (2026 增强版)"
 echo "==============================================="
+show_status
 
-# 检查当前内核
-kernel_ver=$(uname -r | cut -d- -f1 | awk -F. '{print $1"."$2}')
-can_bbr=$(echo "$kernel_ver >= 4.9" | bc 2>/dev/null)
-can_cake=$(echo "$kernel_ver >= 4.19" | bc 2>/dev/null)
+echo "1) 🚀 应用/更新 加速配置 (单线程强化)"
+echo "2) 🆙 升级系统内核"
+echo "3) 🗑️  卸载加速并恢复默认"
+read -p "请选择 [1-3, 默认1]: " OPT; OPT=${OPT:-1}
 
-echo "当前内核版本: $(uname -r)"
-if [[ "$can_bbr" != "1" ]]; then
-    echo "❌ 警告: 当前内核不支持 BBR (需 4.9+)"
-elif [[ "$can_cake" != "1" ]]; then
-    echo "⚠️ 提醒: 当前内核不支持 CAKE (需 4.19+)，仅能开启 FQ"
-else
-    echo "✅ 当前内核支持所有加速选项"
+if [[ "$OPT" == "3" ]]; then
+    rm -f /etc/sysctl.d/99-net-speedup.conf && sysctl --system
+    echo "已恢复默认。" && exit 0
+elif [[ "$OPT" == "2" ]]; then
+    upgrade_kernel && exit 0
 fi
 
+# --- 5. 参数定制与计算 ---
 echo "-----------------------------------------------"
-echo "1) 升级内核"
-echo "2) 应用/更新 TCP 加速配置 (BBR + BDP)"
-echo "3) 卸载加速配置"
-read -p "请选择 [1-3, 默认2]: " MAIN_CHOICE
-MAIN_CHOICE=${MAIN_CHOICE:-2}
+read -p "请输入服务器带宽 (Mbps, 默认 1000): " S_BW; S_BW=${S_BW:-1000}
+read -p "请输入本地下行带宽 (Mbps, 默认 1000): " L_BW; L_BW=${L_BW:-1000}
+read -p "请输入往返延迟 (ms, 默认 160): " RTT; RTT=${RTT:-160}
 
-case $MAIN_CHOICE in
-    1)
-        upgrade_kernel
-        ;;
-    3)
-        rm -f /etc/sysctl.d/99-net-speedup.conf
-        sysctl --system
-        echo "已恢复默认配置。"
-        exit 0
-        ;;
-    *)
-        # 继续执行加速配置逻辑
-        ;;
-esac
-
-# 3. 手动参数输入
-echo "-----------------------------------------------"
-read -p "1. 服务器带宽 (Mbps, 默认 1000): " SRV_BW; SRV_BW=${SRV_BW:-1000}
-read -p "2. 本地下载带宽 (Mbps, 默认 1000): " LOCAL_BW; LOCAL_BW=${LOCAL_BW:-1000}
-read -p "3. 往返延迟 (ms, 默认 160): " LATENCY; LATENCY=${LATENCY:-160}
-
-# 计算瓶颈带宽并计算 3 倍 BDP 缓存
-if [ "$SRV_BW" -lt "$LOCAL_BW" ]; then FINAL_BW=$SRV_BW; else FINAL_BW=$LOCAL_BW; fi
-BDP=$(echo "$FINAL_BW * $LATENCY * 125 * 3" | bc 2>/dev/null)
+# 计算 3 倍 BDP 缓存 (单线程突破 200M 的关键)
+FINAL_BW=$(([ $S_BW < $L_BW ] && echo $S_BW) || echo $L_BW)
+BDP=$(echo "$FINAL_BW * $RTT * 125 * 3" | bc 2>/dev/null)
 BDP=${BDP:-67108864}
+[[ $BDP -lt 16777216 ]] && BDP=16777216
+[[ $BDP -gt 536870912 ]] && BDP=536870912
 
-[ "$BDP" -lt 16777216 ] && BDP=16777216
-[ "$BDP" -gt 536870912 ] && BDP=536870912
-MAX_BUF_MB=$(echo "$BDP / 1024 / 1024" | bc)
+# 6. 算法兼容性检查
+k_major=$(uname -r | cut -d. -f1); k_minor=$(uname -r | cut -d. -f2)
+can_cake=0; [[ $k_major -gt 4 || ($k_major -eq 4 && $k_minor -ge 19) ]] && can_cake=1
 
-# 4. 算法选择
 echo "-----------------------------------------------"
-echo "选择调度算法 (QDisc):"
-echo "1) FQ   (单线程极限速度)"
-if [[ "$can_cake" == "1" ]]; then
-    echo "2) CAKE (延迟平滑优化)"
-else
-    echo "x) CAKE (当前内核不支持，请选 1 或先升级内核)"
-fi
-read -p "选择 [1-2, 默认1]: " QCHOICE; QCHOICE=${QCHOICE:-1}
-[[ "$QCHOICE" == "2" && "$can_cake" == "1" ]] && SELECTED_QDISC="cake" || SELECTED_QDISC="fq"
+echo "选择 QDisc 算法:"
+echo "1) FQ (单线程测速极佳)"
+[[ $can_cake -eq 1 ]] && echo "2) CAKE (抗丢包与游戏优化)" || echo "x) CAKE (需内核 4.19+)"
+read -p "请选择 [1-2, 默认1]: " Q_OPT; Q_OPT=${Q_OPT:-1}
+[[ "$Q_OPT" == "2" && "$can_cake" -eq 1 ]] && SEL_Q="cake" || SEL_Q="fq"
 
-# 5. 模块尝试加载与写入配置
-modprobe tcp_bbr >/dev/null 2>&1
-modprobe sch_fq >/dev/null 2>&1
+# 7. 应用配置
+modprobe tcp_bbr 2>/dev/null
+modprobe sch_$SEL_Q 2>/dev/null
 
 cat > /etc/sysctl.d/99-net-speedup.conf << EOF
-net.core.default_qdisc = $SELECTED_QDISC
+net.core.default_qdisc = $SEL_Q
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = $BDP
 net.core.wmem_max = $BDP
@@ -151,8 +127,6 @@ net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_notsent_lowat = 16384
 EOF
 
-sysctl --system
-echo "-----------------------------------------------"
-echo "✅ 调优配置已尝试应用！"
-echo ">> 当前内核状态提示：如果上方仍报错，请运行脚本并选 1 升级内核。"
-echo "==============================================="
+sysctl --system > /dev/null
+echo -e "\033[32m✅ 加速配置已应用！\033[0m"
+show_status
